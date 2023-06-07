@@ -1,0 +1,314 @@
+---
+title: Interaction of O.Sativa with its pathogen analyzed through Differential Gene
+  Expression
+author: "Clemente Calabrese"
+date: "2023-06-05"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Pre-Analytical Steps
+
+## Loading libraries
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(EnhancedVolcano)
+library(AnnotationDbi)
+library(genekitr)
+library(clusterProfiler)
+```
+
+## Loading Experimental Data
+```{r}
+colData <- read.table("input_Data/experiment_Design.tsv", sep = "\t", header = TRUE, row.names = 1) %>%
+  
+  #I exclude samples that were discarded
+  filter(`Analysed` == "Yes",
+         
+         #I exclude flowering stage samples to keep things simple
+         `Sample.Characteristic.developmental.stage.` == "seedling")  %>% 
+  
+  #then I leave only the factors of interest: resistance to blight & infection status
+  transmute(`resistance` = as.factor(`Factor.Value.phenotype.`),
+            `infection` = as.factor(`Factor.Value.infect.`)) 
+
+# recoding the levels for quicker access
+levels(colData$resistance) <- c("R", "S")
+levels(colData$infection) <- c("TRT", "CTRL")
+
+
+countData <- read.delim("input_Data/rawCounts.tsv", sep = "\t", header = TRUE, row.names = 1) %>%
+  select(all_of(row.names(colData))) #select all the samples selected from colData
+```
+
+How many transcripts were taken into account?
+```{r}
+dim(countData)[1]
+```
+
+## Apply some filtering before feeding this data into DESeq:
+
+Save the initial magnitude of transcripts for later
+```{r}
+initial_count <- dim(countData)[1]
+```
+
+To remove transcripts other than mRNA i ordered the df by gene ID, so I could easily spot that the first transcript mapped with an ENSRNA code were encoding for tRNAs, rRNAs or snRNAs. I searched for the first transcript outside of this subset, labeled as "Os01g0100100" and i subset my data from that transcript to the end of the dataframe.
+```{r}
+countData <- arrange(countData, 
+                     rownames(countData))
+countData <- countData[which(rownames(countData) == "Os01g0100100"):nrow(countData),]
+```
+
+Then I filtered out lowly expressed transcripts.
+```{r}
+countData <- filter(countData, rowSums(countData) > 15)
+```
+
+How many transcripts did we discard?
+```{r}
+initial_count - dim(countData)[1]
+rm(initial_count)
+```
+
+How many transcripts are we left with?
+```{r}
+dim(countData)[1]
+```
+
+### Generating multiple datasets
+Since we're going to make pairwise analyses, we will need different datasets to account for different contrasts we're going to make:
+
+One dds grouping all inoculated samples (Resistant vs Susceptible phenotypes)
+```{r}
+colData_infected <- colData[colData$infection == "TRT",]
+
+countData_infected <- read.delim("input_Data/rawCounts.tsv", 
+                                 sep = "\t", 
+                                 header = TRUE,
+                                 row.names = 1) %>%
+  select(all_of(row.names(colData_infected)))
+
+dim(colData_infected)[1] == dim(countData_infected)[2]
+```
+
+One dds grouping all resistant samples (control vs inoculated R)
+```{r}
+colData_R <- colData[colData$resistance == "R",]
+
+countData_R <- read.delim("input_Data/rawCounts.tsv", 
+                          sep = "\t", 
+                          header = TRUE, 
+                          row.names = 1) %>%
+  select(all_of(row.names(colData_R)))
+
+dim(colData_R)[1] == dim(countData_R)[2]
+```
+
+One dds grouping all susceptible samples (control vs inoculated R)
+```{r}
+colData_S <- colData[colData$resistance == "S",]
+
+countData_S <- read.delim("input_Data/rawCounts.tsv", 
+                          sep = "\t", 
+                          header = TRUE, 
+                          row.names = 1) %>%
+  select(all_of(row.names(colData_S)))
+
+dim(colData_S)[1] == dim(countData_S)[2]
+```
+
+
+Checking if the two vectors contain the same elements and in the same order:
+```{r}
+# this checks if they're the same vector
+all(rownames(colData) == colnames(countData))
+all(rownames(colData_infected) == colnames(countData_infected))
+all(rownames(colData_R) == colnames(countData_R))
+all(rownames(colData_S) == colnames(countData_S))
+```
+### Choosing a suitable design formula
+```{r}
+design <- ~ resistance + infection
+```
+
+#Inspecting the whole dataset
+
+
+Run the DESeq2 pipeline on the whole filtered counts dataset.
+```{r}
+dds <- DESeqDataSetFromMatrix(colData = colData,
+                              countData = countData,
+                              design = ~ resistance + infection)
+
+dds <- DESeq(dds)
+res <- results(dds)
+```
+
+Inspect the MA plot of the results
+```{r}
+DESeq2::plotMA(res)
+```
+
+It would be more informative to contrast the results on the basis of the sample groups:
+```{r}
+RvS <- results(dds, contrast = c("resistance", "R", "S"))
+rTvC <- results(dds, contrast = c("infection", "TRT", "CTRL"))
+sTvC <- results(dds, contrast = c("infection"))
+
+
+```
+
+Inspect the PCA plot:
+```{r}
+dds_rlog <- rlog(dds)
+DESeq2::plotPCA(object = dds_rlog, intgroup = c("resistance", "infection"))
+```
+
+This is an expected result, since I have actually 4 clusters of samples: the pairwise combinations of resistance to blight and infection status.
+
+
+Contrast the results 
+```{r}
+RvS <- results(dds, contrast = c("resistance", "R", "S"))
+```
+
+# Contrast n.1 - Resistant vs Susceptible
+In this dataset there are infected samples belonging both to 
+
+## Creating the DESeq Dataset
+``` {r}
+dds_infected <- DESeqDataSetFromMatrix(countData = countData_infected,
+                              colData = colData_infected,
+                              design = ~ resistance)
+dim(dds_infected)
+```
+
+Excluding the low-expression genes from our analysis:
+```{r}
+# only use the genes actually expressed
+dds_infected <- dds_infected[rowSums(dds_infected@assays@data@listData[["counts"]]) > 1,] 
+dim(dds_infected)
+```
+
+How many genes did we discard?
+```{r}
+dim(countData_infected)[1] - dim(dds_infected)[1]
+```
+
+## Run DESeq and retrieve the results:
+```{r}
+dds_infected <- DESeq(dds_infected)
+results_RvS <- results(dds_infected, contrast=c("resistance", "R", "S"))
+```
+
+Inspect quality of the results with an MA plot:
+```{r}
+plotMA(results_RvS, ylim=c(-2,2))
+```
+Inspect pvalue distribution:
+```{r}
+ggplot(as.data.frame(results_RvS), aes(x = padj)) +
+  geom_histogram()
+```
+
+Inspect PCA plot:
+```{r}
+#first i need the normalized counts
+dds_infected_n <- rlog(dds_infected)
+DESeq2::plotPCA(object = dds_infected_n, intgroup = "resistance")
+```
+
+Inspect magnitudes of DEGs with a Volcano Plot:
+```{r}
+#da aggiungere
+
+```
+
+
+```{r}
+summary(results_RvS)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Filter diff.expressed genes:
+```{r}
+
+  # in the paper it is stated that 
+  # FDR = 0.05 and FoldChange = 2 were the cutoffs
+
+RvS <- as.data.frame(results_RvS) %>%
+  filter(!is.na(.$padj)) %>%
+  filter(.$padj < .05) %>%
+  filter(.$log2FoldChange > 1 |.$log2FoldChange < 1 )
+  
+  
+# How many genes are we left with?
+dim(RvS)[1]
+
+```
+
+
+## GO enrichment analysis
+
+```{r}
+# translating transcript location to HGNC symbols with GeneKitR
+RvS$entrez <- transId(rownames(RvS), 
+                      transTo = "ENTREZID", 
+                      org="osativa", 
+                      unique=TRUE, 
+                      keepNA=TRUE)[,2]
+
+# filtering the genes that mapped to multiple (or none) symbols
+RvS <- filter(RvS, !is.na(RvS$entrez))
+
+#How many genes are we left with?
+dim(RvS)
+
+```
+## Retrieve OrgDb data to map IDs to GO terms
+I found the correct OrgDb by querying AnnotationHub
+```{r}
+# query(ah,'org.Oryza_sativa_Japonica_Group.eg.sqlite')
+```
+
+It gave me the OrgDb name (AH107685) that I can use to access the annotation.
+```{r}
+ah <- AnnotationHub()
+os.db <- ah[["AH107685"]]
+```
+
+
+## Run the GO analysis
+```{r}
+GO_BP <- enrichGO(RvS$entrez, OrgDb = os.db, 
+                  keyType = "ENTREZID", ont = "BP")
+GO_MF <- enrichGO(RvS$entrez, OrgDb = os.db, 
+                  keyType = "ENTREZID", ont = "MF")
+GO_CC <- enrichGO(RvS$entrez, OrgDb = os.db, 
+                  keyType = "ENTREZID", ont = "CC")
+```
+
+
+
+
+
+
+
+
+
